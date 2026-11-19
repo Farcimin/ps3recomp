@@ -1269,7 +1269,26 @@ static void dump_shader(const char* name, const char* text)
     fclose(f);
 }
 
-static MTLCompileOptions* guest_compile_options(void)
+/* RSX_FP_MATH=safe|relaxed|fast: the math mode of the fragment programs
+ * alone (safe unless set). Safe forbids every floating-point optimisation;
+ * relaxed allows them (fused multiply-adds, reassociation, faster pow/exp)
+ * but keeps NaN and infinity as IEEE has them. Relaxed is ~15% less GPU
+ * time a draw on an M4, but the lighting of Zero's model came out visibly
+ * grainier, so it is not the default. The vertex programs stay safe in any
+ * case: the invariant position needs every program to compute it the same
+ * way. */
+static int fp_math_mode(void)
+{
+    static int m = -1;
+    if (m < 0) {
+        const char* e = getenv("RSX_FP_MATH");
+        m = (e && !strcmp(e, "relaxed")) ? 1 : (e && !strcmp(e, "fast")) ? 2 : 0;
+    }
+    return m;
+}
+static MTLCompileOptions* guest_compile_options_for(int fragment);
+static MTLCompileOptions* guest_compile_options(void) { return guest_compile_options_for(0); }
+static MTLCompileOptions* guest_compile_options_for(int fragment)
 {
     MTLCompileOptions* o = [MTLCompileOptions new];
     /* Position invariance across pipelines. A title's depth pre-pass and its
@@ -1289,6 +1308,8 @@ static MTLCompileOptions* guest_compile_options(void)
 #if defined(MAC_OS_VERSION_15_0) && MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_VERSION_15_0
     if (@available(macOS 15.0, *)) {
         o.mathMode = MTLMathModeSafe;
+        if (fragment && fp_math_mode() == 1) o.mathMode = MTLMathModeRelaxed;
+        if (fragment && fp_math_mode() == 2) o.mathMode = MTLMathModeFast;
         return o;
     }
 #endif
@@ -1304,8 +1325,9 @@ static MTLCompileOptions* guest_compile_options(void)
 static id<MTLFunction> compile_guest_function(const char* msl, const char* what)
 {
     NSError* err = nil;
+    const int fragment = !strncmp(what, "fp", 2) || !strncmp(what, "fragment", 8);
     id<MTLLibrary> lib = [s_dev newLibraryWithSource:[NSString stringWithUTF8String:msl]
-                                             options:guest_compile_options()
+                                             options:guest_compile_options_for(fragment)
                                                error:&err];
     if (!lib) {
         fprintf(stderr, "[RSX metal] %s: MSL compile failed: %s\n", what,
@@ -2793,6 +2815,8 @@ typedef struct {
     MTLRenderPipelineDescriptor* pd;
     id<MTLRenderPipelineState>   pso_ms[2][3];
     u8                           zwrite;   /* its draws can write depth or stencil */
+    u8                           zuse;     /* its draws test or write depth or stencil at all */
+    u64                          ps_hash;  /* its fragment program's HLSL, as the MSL cache names it */
     /* An HLSL that writes the HDR highlight plane (an override's
      * rsx_hdr_plane, SV_TARGET1): its build with that plane as colour
      * attachment 1 -- [scaled] -- on first use; plane_failed, a build that
@@ -2877,6 +2901,9 @@ typedef struct {
 } EngRecord;
 
 static EngRecord s_eng_rec[ENG_MAX_RECORDS];
+/* Bumped whenever the record stream is encoded or reset: a record index is
+ * only meaningful within one epoch (eng_color_snapshot). */
+static u32 s_eng_rec_epoch;
 
 /* Occlusion queries: one u64 sample counter per query in a shared buffer
  * that every draw pass names as its visibility result buffer. Counters are
@@ -2928,6 +2955,18 @@ static id<MTLSamplerState>        s_eng_linear_sampler;   /* the present blit, w
  * target format. Depth/stencil rectangles use s_eng_zclear_pso. */
 #define ENG_CLEAR_PSOS 8
 static struct { MTLPixelFormat fmt; id<MTLRenderPipelineState> pso; } s_eng_clear_pso[ENG_CLEAR_PSOS];
+/* Rectangle clears encoded inside the pass that draws into the same targets
+ * (eng_encode_records): a pipeline per set of the pass's colour formats,
+ * writing only the cleared attachment (colour 0) or only depth/stencil. */
+#define ENG_INPASS_PSOS 32
+static struct {
+    MTLPixelFormat fmt[RSX_BE_MAX_COLOR_TARGETS];
+    u32 n;
+    int depth;   /* 1: the depth/stencil clear, 0: colour 0 */
+    id<MTLRenderPipelineState> pso;
+} s_eng_inpass_pso[ENG_INPASS_PSOS];
+static u32 s_eng_inpass_pso_count;
+static id<MTLDepthStencilState> s_eng_nodepth_ds;
 static u32 s_eng_clear_pso_count;
 
 /* PS3_SHARPEN=0..1: contrast-adaptive sharpening (AMD FidelityFX CAS) in the
@@ -3574,6 +3613,7 @@ static void eng_shutdown(void* user)
     memset(s_eng_obj_retired, 0, sizeof s_eng_obj_retired);
     s_eng_pipe_count = s_eng_func_count = s_eng_samp_count = s_eng_view_count = 0;
     s_eng_rec_count = 0;
+    s_eng_rec_epoch++;
     s_eng_last_async_cb = nil;
     for (u32 i = 0; i < s_eng_buf_count; i++) s_eng_buf[i] = nil;
     memset(s_eng_buf_retired, 0, sizeof s_eng_buf_retired);
@@ -3594,6 +3634,9 @@ static void eng_shutdown(void* user)
     s_eng_depth_color_pso[0] = s_eng_depth_color_pso[1] = nil;
     s_eng_depth_color_failed = 0;
     for (u32 k = 0; k < s_eng_clear_pso_count; k++) s_eng_clear_pso[k].pso = nil;
+    for (u32 k = 0; k < s_eng_inpass_pso_count; k++) s_eng_inpass_pso[k].pso = nil;
+    s_eng_inpass_pso_count = 0;
+    s_eng_nodepth_ds = nil;
     s_eng_clear_pso_count = 0;
     s_eng_point_sampler = nil;
     s_eng_linear_sampler = nil;
@@ -3801,20 +3844,41 @@ static u32 eng_depth_target_create(void* user, u32 w, u32 h)
 /* Copy of a colour target, ordered in the record stream. One copy texture
  * per source target is kept and refreshed by each request: the stream is
  * executed in order, so a later copy into the same texture cannot overtake
- * the draw that sampled the earlier one. */
+ * the draw that sampled the earlier one.
+ *
+ * A run of draws that each sample the target they write -- Drakengard 3's
+ * heat haze, dozens a frame in its fights -- asked for a copy apiece, and
+ * each copy ended the render pass: the next draw's pass loaded the whole
+ * target and its depth back from memory for one draw, then stored them
+ * again. On Apple's tile-based GPUs that traffic was most of the frame
+ * (1.4 GB a frame, 18 ms of an M4's GPU). So a copy is taken again only
+ * when something other than draws into this same target came after the
+ * last one: within such a run every draw samples the target as it was at
+ * the run's start, and the run is one pass. RSX_SNAP_REUSE=0: a copy a
+ * draw, as before. */
 static u32 eng_color_snapshot(void* user, u32 surface)
 {
     (void)user;
     id<MTLTexture> t = eng_obj(surface);
     if (!t) return 0;
     if (s_eng_rec_count >= ENG_MAX_RECORDS) { s_eng_dropped++; return 0; }
-    static struct { u32 surface, snap; } pool[32]; static u32 npool;
+    static struct { u32 surface, snap, epoch, after; } pool[32]; static u32 npool;
+    static int reuse = -1;
+    if (reuse < 0) { const char* e = getenv("RSX_SNAP_REUSE"); reuse = !(e && e[0] == '0'); }
     u32 dst = 0, slot = npool;
     for (u32 i = 0; i < npool; i++) if (pool[i].surface == surface) { slot = i; break; }
     if (slot < npool) {
         id<MTLTexture> d = eng_obj(pool[slot].snap);
         if (d && [d width] == [t width] && [d height] == [t height] && [d pixelFormat] == [t pixelFormat])
             dst = pool[slot].snap;
+    }
+    if (dst && reuse && pool[slot].epoch == s_eng_rec_epoch && pool[slot].after <= s_eng_rec_count) {
+        int only_own = 1;
+        for (u32 k = pool[slot].after; k < s_eng_rec_count && only_own; k++) {
+            const EngRecord* r = &s_eng_rec[k];
+            only_own = r->kind == ENG_REC_DRAW && r->nrt == 1 && r->rt[0] == surface;
+        }
+        if (only_own) return dst;
     }
     if (!dst) {
         MTLTextureDescriptor* td =
@@ -3833,6 +3897,8 @@ static u32 eng_color_snapshot(void* user, u32 surface)
     r->kind = ENG_REC_COLOR_COPY;
     r->depth = surface;          /* source */
     r->resolve_dst = dst;
+    pool[slot].epoch = s_eng_rec_epoch;
+    pool[slot].after = s_eng_rec_count;
     return dst;
 }
 static u32 eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
@@ -4752,6 +4818,7 @@ static u32 eng_pipeline_create_locked(void* user, const char* vs_hlsl, const cha
 
     EngPipeline np = {0};
     np.pso = pso;
+    np.ps_hash = fnv1a64(ps_hlsl, (u32)strlen(ps_hlsl), 1469598103934665603ull);
     np.pso_scaled = pso_scaled;
     np.ds  = ds;
     np.ps_wpos = reads_wpos ? strdup(ps_hlsl) : NULL;
@@ -4762,6 +4829,7 @@ static u32 eng_pipeline_create_locked(void* user, const char* vs_hlsl, const cha
     np.hdr_plane = strstr(ps_hlsl, "rsx_hdr_plane") != NULL;
     np.zwrite = (rs->depth_test && rs->depth_write) ||
                 (rs->stencil_enable && (rs->s_write_mask & 0xFFu));
+    np.zuse = rs->depth_test || rs->stencil_enable;
     /* CULL_FACE FRONT=0x0404 BACK=0x0405 FRONT_AND_BACK=0x0408 (front here,
      * as in the D3D12 engine); FRONT_FACE CW=0x0900 CCW=0x0901. */
     np.cull = MTLCullModeNone;
@@ -5614,11 +5682,24 @@ static int eng_record_targets_are(const EngRecord* r, const u32* rt, u32 nrt)
  * is what keeps a mid-frame clear ordered against the draws around it. */
 /* The depth attachment for a pass whose draws named no zeta: a pipeline
  * always declares one. At RSX_SCALE=1 that is the display's shared buffer, as
- * it always was; scaled targets outgrow it, so a buffer grown to cover them. */
+ * it always was; scaled targets outgrow it, so a buffer grown to cover them.
+ *
+ * Its contents mean nothing between passes -- the guest has no depth buffer
+ * there -- so with RSX_ZSCRATCH (on unless 0) it is a scratch buffer of its
+ * own at every scale, cleared as a pass opens and never stored: those passes
+ * (the post-processing, most of a frame's count) no longer load and store a
+ * whole depth buffer through memory, which on a tile-based GPU is most of
+ * what they cost. */
 static id<MTLTexture> s_eng_zfallback;
+static int eng_zscratch(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("RSX_ZSCRATCH"); on = !(e && e[0] == '0'); }
+    return on;
+}
 static id<MTLTexture> eng_fallback_depth(id<MTLTexture> rt0)
 {
-    if (s_eng_scale == 1.0f || !rt0) return s_depth;
+    if (!rt0 || (s_eng_scale == 1.0f && !eng_zscratch())) return s_depth;
     const NSUInteger w = [rt0 width], h = [rt0 height];
     if (!s_eng_zfallback || [s_eng_zfallback width] < w || [s_eng_zfallback height] < h) {
         const NSUInteger nw = s_eng_zfallback && [s_eng_zfallback width]  > w ? [s_eng_zfallback width]  : w;
@@ -5635,21 +5716,294 @@ static id<MTLTexture> eng_fallback_depth(id<MTLTexture> rt0)
     return s_eng_zfallback;
 }
 
+/* RSX_INPASS_CLEAR (on unless 0): a rectangle clear of a target the pass
+ * being encoded draws into is a draw in that pass, not a pass of its own.
+ * Drakengard 3 clears ~25 rectangles a frame in its heavier scenes, each
+ * between draws into the same targets: every one cost a pass that loaded and
+ * stored the whole target for a scissored triangle, and split the pass of
+ * draws around it in two -- which loaded and stored it all again. */
+static int eng_inpass_clear_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("RSX_INPASS_CLEAR"); on = !(e && e[0] == '0'); }
+    return on;
+}
+static id<MTLRenderPipelineState> eng_inpass_pso(MTLRenderPassDescriptor* rp, u32 attach, int depth)
+{
+    MTLPixelFormat fmt[RSX_BE_MAX_COLOR_TARGETS] = {0};
+    for (u32 k = 0; k < attach; k++) fmt[k] = [rp.colorAttachments[k].texture pixelFormat];
+    for (u32 c = 0; c < s_eng_inpass_pso_count; c++) {
+        if (s_eng_inpass_pso[c].n != attach || s_eng_inpass_pso[c].depth != depth) continue;
+        int same = 1;
+        for (u32 k = 0; k < attach && same; k++) same = s_eng_inpass_pso[c].fmt[k] == fmt[k];
+        if (same) return s_eng_inpass_pso[c].pso;
+    }
+    if (s_eng_inpass_pso_count >= ENG_INPASS_PSOS || !s_eng_helper_lib) return nil;
+    MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
+    pd.vertexFunction   = [s_eng_helper_lib newFunctionWithName:@"eng_fullscreen_vs"];
+    pd.fragmentFunction = [s_eng_helper_lib newFunctionWithName:(depth ? @"eng_zclear_fs" : @"eng_clear_fs")];
+    for (u32 k = 0; k < attach; k++) {
+        pd.colorAttachments[k].pixelFormat = fmt[k];
+        pd.colorAttachments[k].writeMask = (!depth && k == 0) ? MTLColorWriteMaskAll : MTLColorWriteMaskNone;
+    }
+    pd.depthAttachmentPixelFormat   = MTL_DEPTH_FORMAT;
+    pd.stencilAttachmentPixelFormat = MTL_DEPTH_FORMAT;
+    NSError* err = nil;
+    id<MTLRenderPipelineState> pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+    if (!pso) {
+        fprintf(stderr, "[rsx engine/metal] in-pass clear pipeline failed: %s\n", [[err localizedDescription] UTF8String]);
+        return nil;
+    }
+    const u32 c = s_eng_inpass_pso_count++;
+    for (u32 k = 0; k < attach; k++) s_eng_inpass_pso[c].fmt[k] = fmt[k];
+    s_eng_inpass_pso[c].n = attach;
+    s_eng_inpass_pso[c].depth = depth;
+    s_eng_inpass_pso[c].pso = pso;
+    return pso;
+}
+/* The rectangle clear r inside the open pass (see above): 1 if done. The
+ * pass's draws set their own state again, the scissor only when they have
+ * one, so the scissor goes back to the whole target after. */
+static int eng_inpass_clear(id<MTLRenderCommandEncoder> enc, MTLRenderPassDescriptor* rp, u32 attach,
+                            const EngRecord* r, id<MTLTexture> tex0)
+{
+    const int depth = r->kind == ENG_REC_CLEAR_DS_RECT;
+    id<MTLTexture> t = depth ? rp.depthAttachment.texture : tex0;
+    if (!t) return 0;
+    int dsi = 0;
+    if (depth) {
+        const int dw = (r->clear_flags & RSX_BE_CLEAR_DEPTH) ? 1 : 0;
+        const int st = (r->clear_flags & RSX_BE_CLEAR_STENCIL) ? 1 : 0;
+        if (!dw && !st) return 1;
+        dsi = dw | (st << 1);
+        if (!s_eng_zclear_ds[dsi]) return 0;   /* made by the first eng_encode_clear_rect */
+    } else if (!s_eng_nodepth_ds) {
+        MTLDepthStencilDescriptor* dd = [MTLDepthStencilDescriptor new];
+        dd.depthCompareFunction = MTLCompareFunctionAlways;
+        dd.depthWriteEnabled = NO;
+        s_eng_nodepth_ds = [s_dev newDepthStencilStateWithDescriptor:dd];
+        if (!s_eng_nodepth_ds) return 0;
+    }
+    id<MTLRenderPipelineState> pso = eng_inpass_pso(rp, attach, depth);
+    if (!pso) return 0;
+    const NSUInteger tw = [t width], th = [t height];
+    u32 rx = r->clear_rect[0], ry = r->clear_rect[1], rw = r->clear_rect[2], rh = r->clear_rect[3];
+    const float fx = eng_obj_fx(depth ? r->depth : r->rt[0]);
+    if (fx != 1.0f) sc_rect_f(fx, &rx, &ry, &rw, &rh);
+    /* the pass's area: the smallest of its attachments (Metal's render area) */
+    NSUInteger aw = tw, ah = th;
+    for (u32 k = 0; k < attach; k++) {
+        id<MTLTexture> a = rp.colorAttachments[k].texture;
+        if ([a width] < aw) aw = [a width];
+        if ([a height] < ah) ah = [a height];
+    }
+    if (rp.depthAttachment.texture) {
+        if ([rp.depthAttachment.texture width] < aw) aw = [rp.depthAttachment.texture width];
+        if ([rp.depthAttachment.texture height] < ah) ah = [rp.depthAttachment.texture height];
+    }
+    if (rx >= aw || ry >= ah) return 1;   /* outside: nothing to clear, as the pass of its own found */
+    NSUInteger w = rw, h = rh;
+    if (rx + w > aw) w = aw - rx;
+    if (ry + h > ah) h = ah - ry;
+    if (!w || !h) return 1;
+    [enc setVisibilityResultMode:MTLVisibilityResultModeDisabled offset:0];
+    [enc setRenderPipelineState:pso];
+    [enc setCullMode:MTLCullModeNone];
+    [enc setDepthBias:0 slopeScale:0 clamp:0];
+    [enc setViewport:(MTLViewport){ 0, 0, (double)aw, (double)ah, 0, 1 }];
+    [enc setScissorRect:(MTLScissorRect){ rx, ry, w, h }];
+    if (depth) {
+        [enc setDepthStencilState:s_eng_zclear_ds[dsi]];
+        [enc setStencilReferenceValue:r->clear_stencil];
+        const float z = r->clear_depth;
+        [enc setFragmentBytes:&z length:sizeof z atIndex:0];
+    } else {
+        [enc setDepthStencilState:s_eng_nodepth_ds];
+        [enc setFragmentBytes:r->clear_rgba length:sizeof r->clear_rgba atIndex:0];
+    }
+    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [enc setScissorRect:(MTLScissorRect){ 0, 0, aw, ah }];
+    return 1;
+}
+
+/* RSX_PASS_TIME=1: the GPU time of every draw pass, from timestamps Metal
+ * takes where its vertex and fragment stages start and end, summed over 5 s
+ * by what the pass draws into (size, format, colour targets, depth) and its
+ * place in the frame; the ten costliest are logged. Apple GPUs overlap a
+ * pass's vertex work with the fragment work of the one before, so the
+ * fragment span is the one to read. */
+#define PT_MAX_PASSES 256
+#define PT_BUFS 8
+typedef struct { u32 w, h, fmt, nrt, zfmt, draws, ord; u64 fp; } PtMeta;
+static int s_pt_on = -1;
+static id<MTLCounterSampleBuffer> s_pt_buf[PT_BUFS];
+static PtMeta s_pt_meta[PT_BUFS][PT_MAX_PASSES];
+static u32 s_pt_cur = ~0u, s_pt_n;
+static double s_pt_tick_ns = 1.0;
+typedef struct { PtMeta key; double vert_ms, frag_ms; u64 n, draws; } PtAgg;
+static PtAgg s_pt_agg[512];
+static u32 s_pt_nagg;
+static u64 s_pt_t0;
+static os_unfair_lock s_pt_lk = OS_UNFAIR_LOCK_INIT;
+static int eng_pt_on(void)
+{
+    if (s_pt_on >= 0) return s_pt_on;
+    s_pt_on = 0;
+    if (!getenv("RSX_PASS_TIME")) return 0;
+    if (![s_dev supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
+        fprintf(stderr, "[pass-time] this GPU takes no timestamps at stage boundaries\n");
+        return 0;
+    }
+    id<MTLCounterSet> ts = nil;
+    for (id<MTLCounterSet> cs in [s_dev counterSets])
+        if ([[cs name] isEqualToString:MTLCommonCounterSetTimestamp]) ts = cs;
+    if (!ts) return 0;
+    for (int b = 0; b < PT_BUFS; b++) {
+        MTLCounterSampleBufferDescriptor* d = [MTLCounterSampleBufferDescriptor new];
+        d.counterSet = ts;
+        d.storageMode = MTLStorageModeShared;
+        d.sampleCount = PT_MAX_PASSES * 4;
+        NSError* err = nil;
+        s_pt_buf[b] = [s_dev newCounterSampleBufferWithDescriptor:d error:&err];
+        if (!s_pt_buf[b]) { fprintf(stderr, "[pass-time] no sample buffer: %s\n", [[err localizedDescription] UTF8String]); return 0; }
+    }
+    /* GPU ticks -> ns, from two correlated samples 50 ms apart */
+    MTLTimestamp c0, g0, c1, g1;
+    [s_dev sampleTimestamps:&c0 gpuTimestamp:&g0];
+    usleep(50000);
+    [s_dev sampleTimestamps:&c1 gpuTimestamp:&g1];
+    mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+    const double cpu_ns = (double)(c1 - c0) * tb.numer / tb.denom;
+    if (g1 > g0) s_pt_tick_ns = cpu_ns / (double)(g1 - g0);
+    fprintf(stderr, "[pass-time] on (%.3f ns a GPU tick)\n", s_pt_tick_ns);
+    s_pt_on = 1;
+    return 1;
+}
+static void eng_pt_report(void)
+{
+    /* under s_pt_lk */
+    PtAgg* a = s_pt_agg;
+    for (u32 i = 0; i < s_pt_nagg; i++)
+        for (u32 j = i + 1; j < s_pt_nagg; j++)
+            if (a[j].frag_ms > a[i].frag_ms) { PtAgg t = a[i]; a[i] = a[j]; a[j] = t; }
+    double tv = 0, tf = 0;
+    for (u32 i = 0; i < s_pt_nagg; i++) { tv += a[i].vert_ms; tf += a[i].frag_ms; }
+    fprintf(stderr, "[pass-time] 5 s: %.1f ms vertex, %.1f ms fragment in all; costliest by fragment time:\n", tv, tf);
+    for (u32 i = 0; i < s_pt_nagg && i < 12; i++)
+        fprintf(stderr, "[pass-time]   #%-3u %4ux%-4u fmt %3u x%u z%-3u fp %016llx %6llu passes, %5.1f draws each: frag %7.1f ms (%4.1f%%), vert %6.1f ms\n",
+                a[i].key.ord, a[i].key.w, a[i].key.h, a[i].key.fmt, a[i].key.nrt, a[i].key.zfmt, (unsigned long long)a[i].key.fp,
+                (unsigned long long)a[i].n, a[i].n ? (double)a[i].draws / a[i].n : 0.0,
+                a[i].frag_ms, tf > 0 ? 100.0 * a[i].frag_ms / tf : 0.0, a[i].vert_ms);
+    s_pt_nagg = 0;
+}
+/* At the start of a command buffer's encoding: a sample buffer of its own. */
+static void eng_pt_begin(void)
+{
+    if (!eng_pt_on()) return;
+    s_pt_cur = (s_pt_cur + 1) % PT_BUFS;
+    s_pt_n = 0;
+}
+static void eng_pt_attach(MTLRenderPassDescriptor* rp, id<MTLTexture> t0, u32 nrt, id<MTLTexture> z)
+{
+    if (s_pt_on <= 0 || s_pt_cur >= PT_BUFS || s_pt_n >= PT_MAX_PASSES) return;
+    const u32 k = s_pt_n++;
+    MTLRenderPassSampleBufferAttachmentDescriptor* sa = rp.sampleBufferAttachments[0];
+    sa.sampleBuffer = s_pt_buf[s_pt_cur];
+    sa.startOfVertexSampleIndex   = 4 * k;
+    sa.endOfVertexSampleIndex     = 4 * k + 1;
+    sa.startOfFragmentSampleIndex = 4 * k + 2;
+    sa.endOfFragmentSampleIndex   = 4 * k + 3;
+    PtMeta* m = &s_pt_meta[s_pt_cur][k];
+    memset(m, 0, sizeof *m);
+    id<MTLTexture> r = t0 ? t0 : z;
+    m->w = r ? (u32)[r width] : 0; m->h = r ? (u32)[r height] : 0;
+    m->fmt = t0 ? (u32)[t0 pixelFormat] : 0; m->nrt = nrt; m->zfmt = z ? (u32)[z pixelFormat] : 0;
+    m->ord = k;
+}
+static void eng_pt_draws(u32 n, u32 pipe)
+{
+    if (s_pt_on <= 0 || s_pt_cur >= PT_BUFS || !s_pt_n) return;
+    s_pt_meta[s_pt_cur][s_pt_n - 1].draws = n;
+    s_pt_meta[s_pt_cur][s_pt_n - 1].fp = (pipe && pipe <= s_eng_pipe_count) ? s_eng_pipe[pipe - 1].ps_hash : 0;
+}
+static void eng_pt_end(id<MTLCommandBuffer> cb)
+{
+    if (s_pt_on <= 0 || s_pt_cur >= PT_BUFS || !s_pt_n) return;
+    const u32 b = s_pt_cur, n = s_pt_n;
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        (void)done;
+        NSData* d = [s_pt_buf[b] resolveCounterRange:NSMakeRange(0, 4 * n)];
+        if (!d) return;
+        const MTLCounterResultTimestamp* ts = (const MTLCounterResultTimestamp*)[d bytes];
+        os_unfair_lock_lock(&s_pt_lk);
+        for (u32 k = 0; k < n; k++) {
+            const u64 v0 = ts[4 * k].timestamp, v1 = ts[4 * k + 1].timestamp;
+            const u64 f0 = ts[4 * k + 2].timestamp, f1 = ts[4 * k + 3].timestamp;
+            const double vm = (v1 > v0 && v0 != MTLCounterErrorValue && v1 != MTLCounterErrorValue) ? (v1 - v0) * s_pt_tick_ns / 1e6 : 0;
+            const double fm = (f1 > f0 && f0 != MTLCounterErrorValue && f1 != MTLCounterErrorValue) ? (f1 - f0) * s_pt_tick_ns / 1e6 : 0;
+            const PtMeta* m = &s_pt_meta[b][k];
+            u32 i = 0;
+            for (; i < s_pt_nagg; i++) {
+                const PtMeta* q = &s_pt_agg[i].key;
+                if (q->w == m->w && q->h == m->h && q->fmt == m->fmt && q->nrt == m->nrt && q->zfmt == m->zfmt && q->ord == m->ord && q->fp == m->fp) break;
+            }
+            if (i == s_pt_nagg) {
+                if (s_pt_nagg >= 512) continue;
+                memset(&s_pt_agg[i], 0, sizeof s_pt_agg[i]);
+                s_pt_agg[i].key = *m;
+                s_pt_nagg++;
+            }
+            s_pt_agg[i].vert_ms += vm; s_pt_agg[i].frag_ms += fm; s_pt_agg[i].n++; s_pt_agg[i].draws += m->draws;
+        }
+        const u64 now = mach_absolute_time();
+        if (!s_pt_t0) s_pt_t0 = now;
+        mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+        if ((double)(now - s_pt_t0) * tb.numer / tb.denom > 5e9) { eng_pt_report(); s_pt_t0 = now; }
+        os_unfair_lock_unlock(&s_pt_lk);
+    }];
+}
+
 static u32 s_ft_passes, s_ft_resolves, s_ft_copies;   /* PS3_FTRACE: per command buffer */
+/* RSX_PASS_STATS=1: the render passes the frames are encoded as, summed over
+ * the 60 presents RSX_GPU_TIME reports (eng_gpu_time_hook): how many, how
+ * small, how many draw into what the pass before drew into (one pass's worth
+ * split in two), what splits them, and the attachment traffic the passes'
+ * loads and stores make (MB, from the textures' sizes). */
+static int s_pst_on = -1;
+static u64 s_pst_passes, s_pst_draws, s_pst_small, s_pst_same, s_pst_zload, s_pst_cload,
+           s_pst_clear_rect, s_pst_copy, s_pst_dres, s_pst_dcol, s_pst_bytes, s_pst_inpass;
+static u32 s_pst_prev_rt[RSX_BE_MAX_COLOR_TARGETS], s_pst_prev_nrt, s_pst_prev_depth;
+static u64 eng_tex_bytes(id<MTLTexture> t)
+{
+    if (!t) return 0;
+    const u64 px = (u64)[t width] * [t height] * ([t sampleCount] ? [t sampleCount] : 1);
+    switch ([t pixelFormat]) {
+    case MTLPixelFormatRGBA16Float: return px * 8;
+    case MTLPixelFormatRGBA32Float: return px * 16;
+    case MTLPixelFormatDepth32Float_Stencil8: return px * 5;
+    default: return px * 4;
+    }
+}
 static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
 {
     u32 i = 0;
+    s_eng_rec_epoch++;
+    eng_pt_begin();
+    if (s_pst_on < 0) s_pst_on = getenv("RSX_PASS_STATS") ? 1 : 0;
     s_ft_passes = s_ft_resolves = s_ft_copies = 0;
     while (i < s_eng_rec_count) {
         if (s_eng_rec[i].kind == ENG_REC_CLEAR_DS_RECT) {
+            s_pst_clear_rect++;
             eng_encode_clear_rect(cb, &s_eng_rec[i++]);
             continue;
         }
         if (s_eng_rec[i].kind == ENG_REC_CLEAR_COLOR_RECT) {
+            s_pst_clear_rect++;
             eng_encode_clear_color_rect(cb, &s_eng_rec[i++]);
             continue;
         }
         if (s_eng_rec[i].kind == ENG_REC_COLOR_COPY) {
+            s_pst_copy++;
             const EngRecord* r = &s_eng_rec[i++];
             id<MTLTexture> src = eng_obj(r->depth);
             id<MTLTexture> dst = eng_obj(r->resolve_dst);
@@ -5669,6 +6023,7 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
             continue;
         }
         if (s_eng_rec[i].kind == ENG_REC_DEPTH_COLOR) {
+            s_pst_dcol++;
             const EngRecord* r = &s_eng_rec[i++];
             id<MTLTexture> src = eng_obj(r->depth);
             id<MTLTexture> dst = eng_obj(r->resolve_dst);
@@ -5690,6 +6045,7 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
             continue;
         }
         if (s_eng_rec[i].kind == ENG_REC_DEPTH_RESOLVE) {
+            s_pst_dres++;
             const EngRecord* r = &s_eng_rec[i++];
             id<MTLTexture> src = eng_obj(r->depth);
             id<MTLTexture> dst = eng_obj(r->resolve_dst);
@@ -5804,6 +6160,25 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
             if (!ok) msn = 1;
         }
 
+        /* A pass none of whose draws test or write depth or stencil -- a
+         * full-screen post-process step that still names the scene's zeta --
+         * takes the scratch depth instead (eng_fallback_depth): the scene's
+         * stays as it is in memory rather than being loaded and stored again
+         * around draws that never look at it. */
+        if (msn == 1 && attach && zbuf && zfallback && zfallback != s_depth && zbuf != zfallback &&
+            !(have_clear_ds && depth == cd) && eng_zscratch()) {
+            const int plane0 = i < s_eng_rec_count && eng_rec_plane(&s_eng_rec[i]);
+            int zfree = i < s_eng_rec_count && s_eng_rec[i].kind == ENG_REC_DRAW;
+            for (u32 j = i; zfree && j < s_eng_rec_count && s_eng_rec[j].kind == ENG_REC_DRAW &&
+                            eng_record_targets_are(&s_eng_rec[j], rt, nrt) &&
+                            (s_eng_rec[j].depth == depth || !s_eng_rec[j].depth) &&
+                            eng_rec_plane(&s_eng_rec[j]) == plane0; j++) {
+                const u32 pj = s_eng_rec[j].pipeline;
+                if (!pj || pj > s_eng_pipe_count || s_eng_pipe[pj - 1].zuse) zfree = 0;
+            }
+            if (zfree) zbuf = zfallback;
+        }
+
         MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
         const u32 vis_pass = ++s_vis_serial ? s_vis_serial : ++s_vis_serial;
         if (s_vis_buf) {
@@ -5845,6 +6220,15 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
                 (clear_here && (ds_flags & RSX_BE_CLEAR_STENCIL))
                     ? MTLLoadActionClear : MTLLoadActionLoad;
             rp.stencilAttachment.clearStencil = cstencil;
+            if (zbuf == zfallback && zbuf == s_eng_zfallback && eng_zscratch()) {
+                /* the scratch depth (eng_fallback_depth): cleared, not kept */
+                rp.depthAttachment.loadAction    = MTLLoadActionClear;
+                rp.depthAttachment.clearDepth    = 1.0;
+                rp.depthAttachment.storeAction   = MTLStoreActionDontCare;
+                rp.stencilAttachment.loadAction  = MTLLoadActionClear;
+                rp.stencilAttachment.clearStencil = 0;
+                rp.stencilAttachment.storeAction = MTLStoreActionDontCare;
+            }
         }
         if (!attach) {
             rp.renderTargetWidth  = [zbuf width];
@@ -5902,6 +6286,7 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
                 plane_pass = 1;
             }
         }
+        if (attach == nrt) eng_pt_attach(rp, attach ? tex[0] : nil, attach, zbuf);
         id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
         u32 cur_vis = 0;
         if (enc && msn > 1) eng_ms_reload(enc, tex, attach, depth, msn, ms_cmask, ms_zw, ms_sw);
@@ -5920,11 +6305,45 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
          * draws' viewports, scissors and WPOS follow it (eng_scales). */
         const float pf = attach ? eng_obj_fx(rt[0]) : eng_obj_fx(depth);
         s_ft_passes++;
-        while (i < s_eng_rec_count && s_eng_rec[i].kind == ENG_REC_DRAW &&
+        const u32 pst_first = i;
+        if (s_pst_on) {
+            s_pst_passes++;
+            int same = nrt == s_pst_prev_nrt && depth == s_pst_prev_depth;
+            for (u32 k = 0; same && k < nrt; k++) same = rt[k] == s_pst_prev_rt[k];
+            s_pst_same += same;
+            s_pst_prev_nrt = nrt; s_pst_prev_depth = depth;
+            for (u32 k = 0; k < nrt; k++) s_pst_prev_rt[k] = rt[k];
+            for (u32 k = 0; k < attach; k++) {
+                const u64 b = eng_tex_bytes(rp.colorAttachments[k].texture);
+                s_pst_bytes += b;   /* the store */
+                if (rp.colorAttachments[k].loadAction == MTLLoadActionLoad) { s_pst_bytes += b; s_pst_cload++; }
+            }
+            if (rp.depthAttachment.texture) {
+                const u64 b = eng_tex_bytes(rp.depthAttachment.texture);
+                if (rp.depthAttachment.storeAction != MTLStoreActionDontCare) s_pst_bytes += b;
+                if (rp.depthAttachment.loadAction == MTLLoadActionLoad) { s_pst_bytes += b; s_pst_zload++; }
+            }
+        }
+        /* rectangle clears that can join this pass (eng_inpass_clear) */
+        const int inpass_ok = eng_inpass_clear_on() && msn == 1 && !plane_pass && attach == nrt;
+        for (;;) {
+            if (inpass_ok && i < s_eng_rec_count &&
+                ((s_eng_rec[i].kind == ENG_REC_CLEAR_DS_RECT && depth && s_eng_rec[i].depth == depth &&
+                  zbuf == eng_obj(depth) && !s_eng_twin[depth - 1]) ||
+                 (s_eng_rec[i].kind == ENG_REC_CLEAR_COLOR_RECT && attach && s_eng_rec[i].rt[0] == rt[0]))) {
+                const int ok = eng_inpass_clear(enc, rp, attach, &s_eng_rec[i], tex[0]);
+                if (!ok) break;
+                if (s_pst_on) s_pst_inpass++;
+                cur_vis = 0;
+                if (s_eng_rec[i].kind == ENG_REC_CLEAR_DS_RECT) pass_zwrite = 1;
+                i++;
+                continue;
+            }
+            if (!(i < s_eng_rec_count && s_eng_rec[i].kind == ENG_REC_DRAW &&
                eng_record_targets_are(&s_eng_rec[i], rt, nrt) &&
                (s_eng_rec[i].depth == depth ||
                 (!s_eng_rec[i].depth && zbuf == zfallback)) &&
-               eng_rec_plane(&s_eng_rec[i]) == want_plane) {
+               eng_rec_plane(&s_eng_rec[i]) == want_plane)) break;
             if (s_vis_buf && s_eng_rec[i].vis != cur_vis) {
                 cur_vis = s_eng_rec[i].vis;
                 if (cur_vis) {
@@ -5944,11 +6363,17 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
             i++;
         }
         [enc endEncoding];
+        eng_pt_draws(i - pst_first, i > pst_first ? s_eng_rec[pst_first].pipeline : 0);
+        if (s_pst_on) {
+            s_pst_draws += i - pst_first;
+            if (i - pst_first <= 2) s_pst_small++;
+        }
         /* A single-sampled pass that wrote depth or stencil leaves the depth
          * twin behind. */
         if (msn == 1 && depth && zbuf != zfallback && pass_zwrite && s_eng_twin[depth - 1])
             s_eng_twin_stale[depth - 1] = 1;
     }
+    eng_pt_end(cb);
 }
 
 /* A full-screen helper pipeline into one colour format, made on first use. */
@@ -6240,6 +6665,18 @@ static void eng_gpu_time_hook(id<MTLCommandBuffer> cb, int pres)
         if (pres && ++npres % 60 == 0) {
             fprintf(stderr, "[gpu-time] %u presents: %.2f ms GPU per present, %.1f command buffers per present\n",
                     npres, acc * 1000.0 / 60.0, ncb / 60.0);
+            if (s_pst_on > 0) {
+                fprintf(stderr, "[pass-stats] per present: %.1f passes, %.1f draws, %.1f passes of <=2 draws, "
+                        "%.1f into the same targets as the pass before, %.1f colour / %.1f depth loads, "
+                        "%.1f MB attachment traffic; between them %.1f rect clears, %.1f copies, "
+                        "%.1f depth resolves, %.1f depth-as-colour; %.1f rect clears inside a pass\n",
+                        s_pst_passes / 60.0, s_pst_draws / 60.0, s_pst_small / 60.0, s_pst_same / 60.0,
+                        s_pst_cload / 60.0, s_pst_zload / 60.0, s_pst_bytes / 60.0 / 1048576.0,
+                        s_pst_clear_rect / 60.0, s_pst_copy / 60.0, s_pst_dres / 60.0, s_pst_dcol / 60.0,
+                        s_pst_inpass / 60.0);
+                s_pst_passes = s_pst_draws = s_pst_small = s_pst_same = s_pst_zload = s_pst_cload = 0;
+                s_pst_clear_rect = s_pst_copy = s_pst_dres = s_pst_dcol = s_pst_bytes = s_pst_inpass = 0;
+            }
             acc = 0; ncb = 0;
         }
         os_unfair_lock_unlock(&lk);
